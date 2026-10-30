@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: Optional gallery date (YYYY-MM-DD, defaults to today in Korea)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gallery-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    name: Keep schedule active
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Refresh workflow activation without commits
+        id: keepalive
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/enable"
+      - name: Report activation issues
+        if: steps.keepalive.outcome == 'failure'
+        run: echo "::warning::Could not refresh workflow activation. Check the scheduled workflow status."
+
+  check:
+    name: Fix and check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.commit_hash || github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Attach source branch
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: git switch --force-create "$SOURCE_BRANCH"
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install tools
+        run: python -m pip install -r requirements-dev.txt
+      - name: Apply safe lint fixes
+        continue-on-error: true
+        run: ruff check --fix --no-unsafe-fixes .
+      - name: Format Python
+        run: ruff format .
+      - name: Commit source fixes
+        id: commit
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: stefanzweifel/git-auto-commit-action@d0b01107b5db882071f96de5dd4b54961ea93f4c # v7
+        with:
+          commit_message: Fix formatting
+          branch: ${{ github.head_ref || github.ref_name }}
+          file_pattern: "scripts/*.py tests/*.py"
+          skip_fetch: true
+          skip_checkout: true
+      - name: Check Python
+        id: check_python
+        continue-on-error: true
+        run: ruff check . && ruff format --check .
+      - name: Report lint issues
+        if: steps.check_python.outcome == 'failure'
+        run: echo "::warning::Python checks found issues. Review the check logs. Gallery validation will continue."
+      - name: Test gallery generation
+        run: python -m unittest discover -s tests -v
+
+  deploy:
+    name: Build and deploy gallery
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install image validation
+        run: python -m pip install -r requirements.txt
+      - name: Download and verify daily photos
+        env:
+          ICLOUD_ALBUM_TOKEN: ${{ vars.ICLOUD_ALBUM_TOKEN }}
+          GALLERY_DATE: ${{ inputs.date }}
+        run: |
+          if [[ -n "$GALLERY_DATE" ]]; then
+            python scripts/update_gallery.py --date "$GALLERY_DATE"
+          else
+            python scripts/update_gallery.py
+          fi
+      - name: Configure Pages
+        uses: actions/configure-pages@v6.0.0
+      - name: Upload gallery
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: site
+      - name: Deploy gallery
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1
